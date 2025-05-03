@@ -1,0 +1,130 @@
+// app/api/(search)/search/route.js
+import MiniSearch from 'minisearch';
+import fs from 'fs/promises';
+import path from 'path';
+import { NextResponse } from 'next/server';
+
+const INDEX_FILE = '/tmp/search-index.json'; // Use /tmp for Vercel
+// const INDEX_FILE = path.join(process.cwd(), 'data', 'search-index.json');
+
+// Load or initialize MiniSearch
+async function loadIndex() {
+  try {
+    const indexData = await fs.readFile(INDEX_FILE, 'utf8');
+    const parsedData = JSON.parse(indexData);
+
+    // Validate parsed data
+    if (!parsedData.fields || !Array.isArray(parsedData.fields)) {
+      throw new Error('Invalid index: missing or invalid fields');
+    }
+    if (!parsedData.documents || !Array.isArray(parsedData.documents)) {
+      throw new Error('Invalid index: missing or invalid documents');
+    }
+
+    // Create MiniSearch instance
+    const miniSearch = new MiniSearch({
+      fields: parsedData.fields,
+      storeFields: ['title', 'description', 'url', 'links'],
+      searchOptions: {
+        boost: { title: 2, content: 1, description: 1.5, links: 1 },
+        fuzzy: 0.3,
+        prefix: true,
+        combineWith: 'OR',
+      },
+    });
+
+    // Add documents
+    miniSearch.addAll(parsedData.documents);
+
+    console.log(`Search index loaded with ${miniSearch.documentCount} documents`);
+    return miniSearch;
+  } catch (error) {
+    console.error('Failed to load index:', error.message);
+    // Return empty MiniSearch instance
+    return new MiniSearch({
+      fields: ['title', 'content', 'description', 'links'],
+      storeFields: ['title', 'description', 'url', 'links'],
+      searchOptions: {
+        boost: { title: 2, content: 1, description: 1.5, links: 1 },
+        fuzzy: 0.3,
+        prefix: true,
+        combineWith: 'OR',
+      },
+    });
+  }
+}
+
+export async function GET(req) {
+  try {
+    // Extract query parameter
+    const query = req.nextUrl.searchParams.get('query');
+    if (!query) {
+      console.warn('No query parameter provided');
+      return NextResponse.json(
+        { error: 'Query parameter is required' },
+        {
+          status: 400,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET',
+            'Access-Control-Allow-Headers': 'Content-Type',
+          },
+        }
+      );
+    }
+
+    console.log(`Searching for: ${query}`);
+
+    // Load index and perform search
+    const miniSearch = await loadIndex();
+    if (miniSearch.documentCount === 0) {
+      console.warn('Search index is empty');
+      return NextResponse.json(
+        { error: 'No documents indexed. Run /api/crawl-and-index first.' },
+        {
+          status: 404,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET',
+            'Access-Control-Allow-Headers': 'Content-Type',
+          },
+        }
+      );
+    }
+
+    const results = miniSearch.search(query, {
+      fields: ['title', 'content', 'description', 'links'],
+      boost: { title: 2, content: 1, description: 1.5, links: 1 },
+      fuzzy: 0.3,
+      prefix: true,
+      combineWith: 'OR',
+    });
+
+    console.log(`Found ${results.length} results for query: ${query}`);
+
+    return NextResponse.json(
+      results,
+      {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      }
+    );
+  } catch (error) {
+    console.error('Search error:', error.message);
+    return NextResponse.json(
+      { error: 'Failed to perform search', details: error.message },
+      {
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      }
+    );
+  }
+}

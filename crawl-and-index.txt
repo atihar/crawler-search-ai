@@ -1,0 +1,340 @@
+// app/api/crawl-and-index/route.js
+import * as cheerio from 'cheerio';
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
+import MiniSearch from 'minisearch';
+import fs from 'fs/promises';
+import fetch from 'node-fetch';
+import { NextResponse } from 'next/server';
+import path from 'path';
+
+export const maxDuration = 300;
+
+const BASE_URL = 'https://idemitsu-lubricants-staging.webflow.io/';
+const INDEX_FILE = '/tmp/search-index.json'; // Use /tmp for Vercel
+// const INDEX_FILE = path.join(process.cwd(), 'data', 'search-index.json');
+
+const miniSearch = new MiniSearch({
+  fields: ['title', 'content', 'description', 'links'],
+  storeFields: ['title', 'description', 'url', 'links'],
+  searchOptions: {
+    boost: { title: 2, content: 1 },
+    fuzzy: 0.3,
+    prefix: true,
+  },
+});
+
+async function crawlPage(url, visited = new Set(), retries = 2) {
+  if (visited.has(url)) {
+    console.log(`Skipping already visited: ${url}`);
+    return { document: null, links: [] };
+  }
+  visited.add(url);
+
+  let browser;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`Attempt ${attempt} - Crawling: ${url}`);
+      browser = await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+      const page = await browser.newPage();
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Encoding': 'gzip, deflate, br',
+      });
+
+      console.log(`Navigating to ${url}`);
+      const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
+      const status = response.status();
+      const headers = response.headers();
+      console.log(`HTTP Status for ${url}: ${status}`);
+      console.log(`Headers for ${url}:`, JSON.stringify(headers, null, 2));
+
+      const html = await page.content();
+      console.log(`HTML content length for ${url}: ${html.length} characters`);
+      console.log(`HTML sample for ${url}: ${html.substring(0, 200)}...`);
+
+      const $ = cheerio.load(html);
+
+      // Extract content
+      const title = $('title').text() || 'No title';
+      const description = $('meta[name="description"]').attr('content') || '';
+      let bodyContent = $('html').text().replace(/\s+/g, ' ').trim().substring(0, 100000) || '';
+      const headings = $('h1, h2, h3, h4, h5').map((i, el) => $(el).text()).get().join(' ');
+
+      // Fallback to raw HTML if no content
+      if (!bodyContent && !headings) {
+        console.warn(`No content extracted from ${url}, falling back to raw HTML`);
+        bodyContent = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 100000) || 'No content available';
+      }
+
+      // Extract internal links
+      const links = $('a')
+        .map((i, el) => {
+          const href = $(el).attr('href');
+          if (!href) return null;
+          try {
+            const absoluteUrl = new URL(href, BASE_URL).href;
+            return {
+              href: absoluteUrl,
+              text: $(el).text().trim(),
+            };
+          } catch (e) {
+            return null;
+          }
+        })
+        .get()
+        .filter(link => link && link.href.startsWith(BASE_URL));
+
+      console.log(`Found ${links.length} internal links on ${url}`);
+      console.log(`Extracted content length: ${bodyContent.length} characters`);
+      console.log(`Content sample for ${url}: ${bodyContent.substring(0, 100)}...`);
+
+      const document = {
+        id: url,
+        title,
+        description,
+        content: `${headings} ${bodyContent}`,
+        url,
+        links: links.map(link => `${link.text} (${link.href})`).join(' '),
+        lastCrawled: new Date().toISOString(),
+      };
+
+      console.log(`Document created for ${url}: ${title}`);
+
+      return {
+        document,
+        links: links.map(link => link.href),
+      };
+    } catch (error) {
+      console.error(`Attempt ${attempt} - Error crawling ${url}:`, error.message);
+      if (error.message.includes('ENOEXEC') || attempt === retries) {
+        console.warn(`Skipping ${url} due to persistent error, attempting fetch fallback`);
+        return await fetchFallback(url);
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait before retry
+    } finally {
+      if (browser) await browser.close();
+    }
+  }
+}
+
+// Fallback to node-fetch if Puppeteer fails
+async function fetchFallback(url) {
+  try {
+    console.log(`Fetching fallback for ${url}`);
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Encoding': 'gzip, deflate, br',
+      },
+    });
+    const status = response.status;
+    const headers = Object.fromEntries(response.headers.entries());
+    console.log(`Fetch HTTP Status for ${url}: ${status}`);
+    console.log(`Fetch Headers for ${url}:`, JSON.stringify(headers, null, 2));
+
+    if (!response.ok) {
+      throw new Error(`Fetch failed with status ${status}`);
+    }
+
+    const html = await response.text();
+    console.log(`Fetch HTML content length for ${url}: ${html.length} characters`);
+    console.log(`Fetch HTML sample for ${url}: ${html.substring(0, 200)}...`);
+
+    const $ = cheerio.load(html);
+
+    // Extract content
+    const title = $('title').text() || 'No title';
+    const description = $('meta[name="description"]').attr('content') || '';
+    let bodyContent = $('html').text().replace(/\s+/g, ' ').trim().substring(0, 100000) || '';
+    const headings = $('h1, h2, h3, h4, h5').map((i, el) => $(el).text()).get().join(' ');
+
+    // Fallback to raw HTML if no content
+    if (!bodyContent && !headings) {
+      console.warn(`No content extracted from ${url} via fetch, falling back to raw HTML`);
+      bodyContent = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 100000) || 'No content available';
+    }
+
+    // Extract internal links
+    const links = $('a')
+      .map((i, el) => {
+        const href = $(el).attr('href');
+        if (!href) return null;
+        try {
+          const absoluteUrl = new URL(href, BASE_URL).href;
+          return {
+            href: absoluteUrl,
+            text: $(el).text().trim(),
+          };
+        } catch (e) {
+          return null;
+        }
+      })
+      .get()
+      .filter(link => link && link.href.startsWith(BASE_URL));
+
+    console.log(`Fetch found ${links.length} internal links on ${url}`);
+    console.log(`Fetch extracted content length: ${bodyContent.length} characters`);
+    console.log(`Fetch content sample for ${url}: ${bodyContent.substring(0, 100)}...`);
+
+    const document = {
+      id: url,
+      title,
+      description,
+      content: `${headings} ${bodyContent}`,
+      url,
+      links: links.map(link => `${link.text} (${link.href})`).join(' '),
+      lastCrawled: new Date().toISOString(),
+    };
+
+    console.log(`Fetch document created for ${url}: ${title}`);
+
+    return {
+      document,
+      links: links.map(link => link.href),
+    };
+  } catch (error) {
+    console.error(`Fetch fallback failed for ${url}:`, error.message);
+    return { document: null, links: [] };
+  }
+}
+
+export async function GET() {
+  try {
+    const visited = new Set();
+    const toCrawl = [BASE_URL];
+    const documents = [];
+    const failedUrls = [];
+    let crawlCount = 0;
+    const maxCrawl = 5;
+
+    while (toCrawl.length > 0 && crawlCount < maxCrawl) {
+      const url = toCrawl.pop();
+      const { document, links } = await crawlPage(url, visited);
+
+      if (document) {
+        console.log(`Document added for ${url}: ${document.title}`);
+        documents.push(document);
+      } else {
+        console.warn(`No document created for ${url}`);
+        failedUrls.push(url);
+      }
+
+      for (const link of links) {
+        if (
+          !visited.has(link) &&
+          !toCrawl.includes(link) &&
+          !link.match(/\.(pdf|jpg|png|gif|zip|css|js)$/i)
+        ) {
+          toCrawl.push(link);
+        }
+      }
+
+      crawlCount++;
+      console.log(`Crawled ${crawlCount} pages, ${toCrawl.length} remaining`);
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    if (crawlCount >= maxCrawl) {
+      console.warn('Max crawl limit reached');
+    }
+
+    // Fallback document if none created
+    if (documents.length === 0) {
+      console.warn('No documents crawled, adding fallback document');
+      documents.push({
+        id: BASE_URL,
+        title: 'Fallback Document',
+        description: 'No content crawled',
+        content: 'Failed to crawl content from the site. Please check site accessibility.',
+        url: BASE_URL,
+        links: '',
+        lastCrawled: new Date().toISOString(),
+      });
+    }
+
+    console.log(`Indexing ${documents.length} documents`);
+    console.log(`Failed URLs: ${failedUrls.length > 0 ? failedUrls.join(', ') : 'None'}`);
+    miniSearch.addAll(documents);
+
+    // Verify MiniSearch state
+    const documentCount = miniSearch.documentCount;
+    console.log(`MiniSearch contains ${documentCount} documents`);
+
+    if (documentCount === 0) {
+      console.error('No documents added to MiniSearch. Check document structure.');
+      return NextResponse.json(
+        { error: 'No documents indexed. Check crawl output.', failedUrls },
+        {
+          status: 500,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET',
+            'Access-Control-Allow-Headers': 'Content-Type',
+          },
+        }
+      );
+    }
+
+    try {
+      const indexData = miniSearch.toJSON();
+      const indexJson = {
+        fields: ['title', 'content', 'description', 'links'],
+        documents: indexData.documents || documents,
+      };
+      await fs.writeFile(INDEX_FILE, JSON.stringify(indexJson, null, 2));
+      console.log(`Index successfully saved to ${INDEX_FILE}`);
+      const savedData = await fs.readFile(INDEX_FILE, 'utf8');
+      console.log(`Saved index size: ${savedData.length} characters`);
+      console.log(`Saved index content sample: ${savedData.substring(0, 200)}...`);
+    } catch (error) {
+      console.error('Failed to save index:', error.message);
+      return NextResponse.json(
+        { error: 'Failed to save index file', details: error.message, failedUrls },
+        {
+          status: 500,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET',
+            'Access-Control-Allow-Headers': 'Content-Type',
+          },
+        }
+      );
+    }
+
+    return NextResponse.json(
+      { message: `Indexed ${documents.length} pages`, documents, failedUrls },
+      {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      }
+    );
+  } catch (error) {
+    console.error('Indexing error:', error.message);
+    return NextResponse.json(
+      { error: 'Failed to index site', details: error.message },
+      {
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      }
+    );
+  }
+}

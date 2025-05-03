@@ -1,0 +1,1 @@
+it should be an nextjs app
